@@ -40,3 +40,17 @@ pytest tests/          # 运行测试
 |---|---|
 | `DEEPSEEK_API_KEY` | DeepSeek API Key |
 | `DEEPSEEK_BASE_URL` | 默认 `https://api.deepseek.com` |
+
+## 赛后复盘工具链（scripts/）
+
+比赛结束后基于盘上产物构建的离线复盘管线（零 LLM API、规则化可复算）：
+
+- **retrieve_dump.py**：按题型差异化的证据包导出（mcq/multi/tf/计算题各自独立的上下文预算与查询策略），内置规则系保底（选项×文档感知的四级规则）与 `RB_SKIP_*` 单变量对照开关
+- **answer_judge.py**：判分单一真源——字母题全等 + 数值题容差（0.5% 相对误差、约剥离、token 序列校验），`eval_v2` / `eval_faith` / `eval_report` 三处共用，杜绝多副本漂移
+- **eval_rag / eval_faith / eval_report**：三层评测（检索 Recall@bundle + MRR、生成 Accuracy + 多选 F1、忠实度 2×2 归因矩阵），全部规则化、可复算
+- **rebuild_indexes / verify_indexes**：BM25 + FAISS 三件套串行重建与完整性校验
+- **chunker 实验**：v2（域 profile/token 预算）至 v5（bge-small 语义断点检测）及双粒度混合的完整探索实现，含负结果归档
+
+## 运行间噪声与实验纪律
+
+检索管线存在 ±1-2 题（百分榜样本）的运行间噪声（疑源：CrossEncoder CPU 推理的浮点归约顺序）。单变量实验结论必须超出噪声带方可采信；脚本化变更失败必须阻塞依赖它的长任务。
