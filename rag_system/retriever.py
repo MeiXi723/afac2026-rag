@@ -45,8 +45,13 @@ class Retriever:
     def _search_single(
         self, question: dict, domain: str, query: str, doc_ids: Optional[list[str]] = None
     ) -> Optional[list[dict]]:
-        bm25_results = self._bm25_search(domain, query, self.config.top_n_bm25, doc_ids)
-        emb_results = self._embedding_search(domain, query, self.config.top_n_embedding, doc_ids)
+        boost = bool(question.get("_retry_boost"))
+        bm25_results = self._bm25_search(
+            domain, query, self.config.top_n_bm25 * (2 if boost else 1), doc_ids
+        )
+        emb_results = self._embedding_search(
+            domain, query, self.config.top_n_embedding * (2 if boost else 1), doc_ids
+        )
         merged = self._rrf_fusion(bm25_results, emb_results, domain, query)
 
         if len(merged) < 3:
@@ -61,6 +66,8 @@ class Retriever:
         balanced = self._balance_docs(supplemented)
 
         difficulty = self._assess_difficulty(question)
+        if boost:
+            difficulty = "hard"
         final = self._dynamic_truncate(balanced, difficulty, doc_ids)
 
         return final
@@ -145,7 +152,11 @@ class Retriever:
             if self.config.cloud_embedding:
                 query_vec = model.embed_query(query)
             else:
-                query_vec = model.encode([query], normalize_embeddings=True)
+                # E5：bge 官方推荐短查询加检索指令前缀（passage 不加）
+                q = query
+                if hasattr(self.config, 'bge_query_instruction') and self.config.bge_query_instruction:
+                    q = self.config.bge_query_instruction + query
+                query_vec = model.encode([q], normalize_embeddings=True)
                 query_vec = np.array(query_vec, dtype=np.float32)
             scores, indices = index.search(query_vec, min(top_n * 3, index.ntotal))
         except Exception:
@@ -215,6 +226,7 @@ class Retriever:
             if chunk_info:
                 item.setdefault("doc_id", chunk_info.get("doc_id", ""))
                 item.setdefault("section_path", chunk_info.get("section_path", ""))
+                item.setdefault("pages", chunk_info.get("pages", []))  # P1-1: 页码透传
                 if not item.get("text"):
                     item["text"] = chunk_info.get("text", "")
 
@@ -248,7 +260,9 @@ class Retriever:
             return results
 
         all_fields = {**field_index.get("dates", {}), **field_index.get("amounts", {}), **field_index.get("percentages", {})}
-        boost = 0.15
+        # boost 必须与 RRF 分同量级（顶分=1/(k+1)：k=60 时≈0.0164、k=10 时≈0.0909）。
+        # 旧值 0.15 在 k=60 下是顶分的 9 倍，一次字段命中即可劫持整个排序（外部审查 P1-6）
+        boost = 0.005
         for r in results:
             cid = r["chunk_id"]
             for field_val, chunk_ids in all_fields.items():
@@ -272,11 +286,18 @@ class Retriever:
             model = self._get_cross_encoder()
             if model is None:
                 return candidates
+            # 只重排融合前 25 名：救回案例全部位于此区间（E2 实测），
+            # 全量重排在 CPU 上不可承受（降耗后全量 100 题实测 67 分钟）
+            candidates = candidates[:25]  # E7 已回退（2026-10-09）：35 与 E6 词典联合实测 90.2%<v7 基线 90.9%，未转正
             pairs = [(query, c.get("text", "")) for c in candidates]
             scores = model.predict(pairs)
             for c, s in zip(candidates, scores):
                 c["rerank_score"] = float(s)
             candidates.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
+            # 写回 score：下游 _quality_filter/_balance_docs/_dynamic_truncate 全部
+            # 按 score 重排，不写回则精排顺序被完全抵消（P1#2）
+            for c in candidates:
+                c["score"] = c["rerank_score"]
             return candidates
         except Exception:
             logger.exception("CrossEncoder rerank failed, returning original order")
@@ -348,7 +369,8 @@ class Retriever:
         supplemented = self._supplement_docs(filtered, domain, doc_ids)
         balanced = self._balance_docs(supplemented)
 
-        difficulty = self._assess_difficulty(question)
+        difficulty = ("hard" if question.get("_retry_boost")
+                      else self._assess_difficulty(question))
         final = self._dynamic_truncate(balanced, difficulty, doc_ids)
 
         return final
@@ -420,6 +442,10 @@ class Retriever:
         try:
             with open(bm25_path, "rb") as f:
                 data = pickle.load(f)
+            # E3：k1/b 为打分期参数，加载后按 config 覆盖（无需重建索引）
+            if hasattr(data["model"], "k1"):
+                data["model"].k1 = self.config.bm25_k1
+                data["model"].b = self.config.bm25_b
             self._bm25_cache[domain] = data
             return data
         except Exception:
@@ -463,13 +489,16 @@ class Retriever:
         if self._cross_encoder_failed:
             return None
         if self._cross_encoder is None:
-            if self.config.skip_embedding or self.config.cloud_embedding:
+            # 精排是本地 CrossEncoder 模型，与 embedding 通道（本地/云）无关——
+            # 旧版连坐禁用是耦合 bug。模型未缓存时在此处触发下载，失败则优雅降级。
+            if self.config.skip_embedding and not getattr(self.config, 'enable_rerank', True):
                 self._cross_encoder_failed = True
                 return None
             try:
                 from sentence_transformers import CrossEncoder
 
-                self._cross_encoder = CrossEncoder(self.config.reranker_model)
+                # max_length=384：query+passage 场景截断损失极小，CPU 提速 ~25%
+                self._cross_encoder = CrossEncoder(self.config.reranker_model, max_length=384)
             except Exception:
                 logger.warning("CrossEncoder init failed, rerank disabled")
                 self._cross_encoder_failed = True
@@ -495,8 +524,10 @@ class Retriever:
 
         seen: set[int] = set()
         deduped: list[dict] = []
+        # 归一化后哈希：PDF 词中空格伪影（"养 老保险金"）原文 hash 不同但语义相同
+        from rag_system.eval_norm import norm as _norm
         for r in sorted(results, key=lambda x: x.get("score", 0), reverse=True):
-            h = hash(r.get("text", ""))
+            h = hash(_norm(r.get("text", "")))
             if h not in seen:
                 seen.add(h)
                 deduped.append(r)
@@ -573,9 +604,10 @@ class Retriever:
         compare_kw = {"对比", "差异", "区别", "哪些", "分别是", "各自", "分别"}
         hard_kw = {"顺序", "先后", "依次", "流程", "步骤"}
 
-        has_calc = bool(calc_kw & set(qtext))
-        has_compare = bool(compare_kw & set(qtext))
-        has_hard = bool(hard_kw & set(qtext))
+        # 注意：set(qtext) 是单字集合，与二字词交集恒空——必须用子串包含
+        has_calc = any(k in qtext for k in calc_kw)
+        has_compare = any(k in qtext for k in compare_kw)
+        has_hard = any(k in qtext for k in hard_kw)
 
         if num_docs >= 3 or has_hard or (qtype == "multi" and num_options > 3):
             return "hard"
@@ -584,6 +616,8 @@ class Retriever:
         return "easy"
 
     def _dynamic_truncate(self, results: list[dict], difficulty: str, doc_ids: Optional[list[str]]) -> list[dict]:
+        # 难度只决定保留数量；排序纯按分数。旧版"每文档配额 2"会让目录/阅读指引
+        # 等高频词块挤掉同文档的低频决定性条款（冒烟实测 ins_a_001 被挤掉 1.1.6）。
         max_map = {
             "easy": self.config.max_chunks_easy,
             "medium": self.config.max_chunks_medium,
@@ -591,30 +625,18 @@ class Retriever:
         }
         max_chunks = max_map.get(difficulty, self.config.max_chunks_medium)
 
-        if len(results) <= max_chunks:
-            return results
+        results = sorted(results, key=lambda x: x.get("score", 0), reverse=True)
+        kept = results[:max_chunks]
 
-        doc_ids_list = doc_ids or []
-        doc_quota: dict[str, int] = {did: 2 for did in doc_ids_list}
-
-        selected: list[dict] = []
-        remaining: list[dict] = []
-        doc_count: dict[str, int] = {}
-
-        for r in results:
-            did = r.get("doc_id", "") or "__unknown__"
-            cur = doc_count.get(did, 0)
-            quota = doc_quota.get(did, 2)
-            if cur < quota:
-                selected.append(r)
-                doc_count[did] = cur + 1
-            else:
-                remaining.append(r)
-
-        slots_left = max_chunks - len(selected)
-        if slots_left > 0:
-            remaining.sort(key=lambda x: x.get("score", 0), reverse=True)
-            selected.extend(remaining[:slots_left])
-
-        selected.sort(key=lambda x: x.get("score", 0), reverse=True)
-        return selected[:max_chunks]
+        # 每文档覆盖保底：doc_ids 内每份文档至少保留其最高分的 1 块
+        if doc_ids:
+            kept_ids = {r.get("chunk_id") for r in kept}
+            covered = {r.get("doc_id") for r in kept}
+            for r in results:
+                did = r.get("doc_id")
+                if did in (doc_ids or []) and did not in covered:
+                    if r.get("chunk_id") not in kept_ids:
+                        kept.append(r)
+                        kept_ids.add(r.get("chunk_id"))
+                    covered.add(did)
+        return kept

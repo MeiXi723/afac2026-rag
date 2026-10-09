@@ -134,10 +134,12 @@ class Chunker:
         return result
 
     def _dedup_chunks(self, chunks: list[Chunk]) -> list[Chunk]:
+        # 归一化后哈希：与 eval_norm 同口径，消除空格伪影导致的漏去重
+        from rag_system.eval_norm import norm as _norm
         seen: set[int] = set()
         result: list[Chunk] = []
         for chunk in chunks:
-            h = hash(chunk.text)
+            h = hash(_norm(chunk.text))
             if h not in seen:
                 seen.add(h)
                 result.append(chunk)

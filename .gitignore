@@ -1,10 +1,22 @@
 .env
 __pycache__/
-*.pyc
 .pytest_cache/
+*.pyc
+*.pyo
 .venv/
 venv/
-.coverage
-data/
+data/parsed/
+data/chunks/
+data/indexes/
 output/
-CLAUDE.md
+# 2026-10-09 收官补全：敏感凭证 + 索引变体 + 临时产物
+.platform_credentials
+data/chunks_v2/
+data/chunks_v5/
+data/chunks_mix/
+data/indexes_v2/
+data/indexes_v5/
+data/indexes_mix/
+data/eval/report_history/
+tmp/
+*.log

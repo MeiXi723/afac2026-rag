@@ -86,17 +86,15 @@ class Pipeline:
 
             t0 = time.time()
             gen_result = self.generator.answer_question(q)
+            validated = self._validate(gen_result, q)
 
-            if "deepseek" in gen_result:
-                ds_raw = gen_result["deepseek"]
-                qw_raw = gen_result["qwen"]
-                ds_parsed = _extract_json_answer(ds_raw) if isinstance(ds_raw, str) else ds_raw
-                qw_parsed = _extract_json_answer(qw_raw) if isinstance(qw_raw, str) else qw_raw
-                validated = self.validator.validate(ds_parsed, qw_parsed, q)
-            else:
-                validated = dict(gen_result)
-                if "confidence" not in validated:
-                    validated["confidence"] = "medium" if validated.get("answer") else "failed"
+            if not validated.get("answer"):
+                # 空答案兜底：提升检索上限并追加文档头部回退，再答一次
+                q2 = dict(q, _retry_boost=True)
+                retried = self._validate(self.generator.answer_question(q2), q)
+                if retried.get("answer"):
+                    validated = retried
+                    validated["retried_boost"] = True
 
             validated["qid"] = q["qid"]
             validated["domain"] = q.get("domain", "")
@@ -125,6 +123,19 @@ class Pipeline:
         self._write_run_log(run_log_entries)
 
         return results
+
+    def _validate(self, gen_result: dict, question: dict) -> dict:
+        if "deepseek" in gen_result:
+            ds_raw = gen_result["deepseek"]
+            qw_raw = gen_result["qwen"]
+            ds_parsed = _extract_json_answer(ds_raw) if isinstance(ds_raw, str) else ds_raw
+            qw_parsed = _extract_json_answer(qw_raw) if isinstance(qw_raw, str) else qw_raw
+            validated = self.validator.validate(ds_parsed, qw_parsed, question)
+        else:
+            validated = dict(gen_result)
+            if "confidence" not in validated:
+                validated["confidence"] = "medium" if validated.get("answer") else "failed"
+        return validated
 
     def _collect_documents(self) -> list[tuple[Path, str]]:
         docs: list[tuple[Path, str]] = []

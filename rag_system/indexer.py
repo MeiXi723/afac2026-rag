@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import pickle
 import re
 import shutil
@@ -52,7 +53,7 @@ class Indexer:
         logger.info("Building embedding index for domain=%s, chunks=%d", domain, len(chunks))
         if emb_dir.exists():
             shutil.rmtree(emb_dir)
-        tmp_dir = domain_dir / "embedding.tmp"
+        tmp_dir = domain_dir / f"embedding.tmp.{os.getpid()}"  # 带 pid：并发重建不再互删固定名（P2#6）
         if tmp_dir.exists():
             shutil.rmtree(tmp_dir)
         tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -199,7 +200,25 @@ class Indexer:
             return None
 
 
+_domain_dict_loaded = False
+
+def _load_domain_dict():
+    global _domain_dict_loaded
+    if _domain_dict_loaded:
+        return
+    dict_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'domain_dict.txt')
+    if os.path.exists(dict_path):
+        import jieba
+        for line in open(dict_path, encoding='utf-8'):
+            parts = line.strip().split()
+            if parts:
+                jieba.add_word(parts[0], freq=int(parts[1]) if len(parts) > 1 else 1000)
+        _domain_dict_loaded = True
+        logging.info('Domain dictionary loaded')
+
+
 def jieba_lcut(text: str) -> list[str]:
+    _load_domain_dict()
     import jieba
 
     return jieba.lcut(text)

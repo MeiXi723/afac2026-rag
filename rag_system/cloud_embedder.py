@@ -59,6 +59,10 @@ class CloudEmbedder:
                 )
                 return vectors
             except Exception as e:
+                # 鉴权失败重试无意义，直接失败让上层降级为 BM25-only
+                msg = str(e)
+                if '401' in msg or 'api_key' in msg.lower():
+                    raise RuntimeError(f'Embedding auth failed: {e}') from e
                 last_exc = e
                 delay = self.config.retry_base_delay * (2 ** attempt)
                 logger.warning(

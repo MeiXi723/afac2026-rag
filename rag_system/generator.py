@@ -54,10 +54,15 @@ def _try_brace(raw: str) -> Optional[dict]:
 
 
 def _try_regex_letters(raw: str) -> Optional[dict]:
-    letters = re.findall(r'\b([A-D])\b', raw)
-    unique = list(dict.fromkeys(letters))
-    if unique:
-        return {"answer": "".join(unique), "reasoning": "", "evidence_ids": [], "parse_fallback": True}
+    # 仅在强信号下提取字母，防止从长篇 reasoning 里捞任意字母拼造答案
+    text = raw.strip()
+    if len(text) > 200:
+        return None
+    m = re.search(r"(?:答案|answer|选[项择]?)([^\nA-Da-d]{0,12})([A-Da-d]{1,4})(?![A-Da-d])", text, re.I)
+    if m and not re.search(r"不是|不选|非|并无|没有", m.group(1)):
+        return {"answer": m.group(2).upper(), "reasoning": "", "evidence_ids": [], "parse_fallback": True}
+    if re.fullmatch(r"[A-Da-d]{1,4}", text):
+        return {"answer": text.upper(), "reasoning": "", "evidence_ids": [], "parse_fallback": True}
     return None
 
 
@@ -189,6 +194,12 @@ class Generator:
     def answer_question(self, question: dict) -> dict:
         answer_format = question.get("answer_format", "mcq")
         evidence = self.retriever.search(question)
+        if question.get("_retry_boost"):
+            # 兜底重试：合并文档头部回退块，避免主检索全空
+            fb = self.retriever._fallback_search(question, question.get("domain", ""))
+            if fb:
+                seen = {c["chunk_id"] for c in evidence or []}
+                evidence = (evidence or []) + [c for c in fb if c["chunk_id"] not in seen]
         if not evidence:
             return {"answer": "", "confidence": "failed", "reasoning": "no evidence"}
         evidence = _expand_context(
@@ -311,7 +322,7 @@ class Generator:
         return self._call_api("deepseek", prompt)
 
     def _call_qwen(self, prompt: str) -> str:
-        return ""
+        return self._call_api("qwen", prompt)
 
     def _call_api(self, provider: str, prompt: str) -> str:
         if provider == "deepseek":
@@ -330,7 +341,11 @@ class Generator:
                     max_tokens=self.config.generator_max_tokens,
                 )
                 return response.choices[0].message.content or ""
-            except Exception:
+            except Exception as e:
+                msg = str(e)
+                if '401' in msg or 'api_key' in msg.lower() or 'insufficient' in msg.lower():
+                    logger.error('%s API auth/billing error, giving up: %s', provider, msg[:200])
+                    return ""
                 if attempt < self.config.max_retries - 1:
                     time.sleep(self.config.retry_base_delay * (2 ** attempt))
                 else:

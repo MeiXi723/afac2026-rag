@@ -75,9 +75,11 @@ class Validator:
         ds_result: dict, qw_result: dict, answer_format: str,
     ) -> str:
         if answer_format == "multi":
-            ds_set = set(ds_answer)
-            qw_set = set(qw_answer)
-            return "".join(sorted(ds_set | qw_set))
+            # 并集会系统性膨胀多选答案；改保守交集，完全无交集时才保留候选并集
+            common = set(ds_answer) & set(qw_answer)
+            if common:
+                return "".join(sorted(common))
+            return "".join(sorted(set(ds_answer) | set(qw_answer)))
         if answer_format == "tf":
             return ds_answer
         return ds_answer

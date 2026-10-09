@@ -71,6 +71,18 @@ class TestRetriever:
             "top_n_rerank": 5,
             "rrf_k": 60,
             "retrieval_workers": 2,
+            # 与 RAGConfig 保持同步的检索参数（夹具曾缺以下字段导致 12 例失败）
+            "bm25_score_threshold": 0.0,
+            "embedding_score_threshold": 0.0,
+            "min_chunk_length": 10,
+            "min_chunks_per_doc": 0,
+            "max_chunks_per_doc": 8,
+            "max_chunks_easy": 5,
+            "max_chunks_medium": 10,
+            "max_chunks_hard": 15,
+            "context_expand_neighbors": 1,
+            "skip_embedding": True,
+            "cloud_embedding": False,
         })()
         retriever = Retriever(retriever_cfg)
         return retriever, chunks
